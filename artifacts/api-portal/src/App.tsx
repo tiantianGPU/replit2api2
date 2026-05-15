@@ -12,9 +12,20 @@ const GREEN = "hsl(145, 65%, 55%)";
 const ORANGE = "hsl(28, 95%, 65%)";
 
 const OPENAI_MODELS = ["gpt-5.2", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3"];
-const ANTHROPIC_MODELS = ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"];
+const ANTHROPIC_MODELS = [
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-opus-4-6-thinking",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5",
+];
 
 const BASE_URL = window.location.origin;
+
+// PROXY_API_KEY is generated at build time by scripts/gen-proxy-key.mjs and
+// baked into the bundle here. The same key is loaded by api-server at boot.
+const PROXY_API_KEY =
+  (import.meta.env.VITE_PROXY_API_KEY as string | undefined) ?? "";
 
 function CopyButton({ text, style }: { text: string; style?: React.CSSProperties }) {
   const [copied, setCopied] = useState(false);
@@ -198,19 +209,19 @@ const STEPS = [
   },
   {
     title: "Set Base URL & API Key",
-    desc: `Set the Base URL to ${BASE_URL} and paste your PROXY_API_KEY as the API key.`,
+    desc: `Set the Base URL to ${BASE_URL} and copy the API key shown above into the API Key field.`,
   },
   {
     title: "Select a Model & Chat",
-    desc: "Pick any listed model — gpt-5.2, claude-sonnet-4-6, o3, etc. — and start chatting.",
+    desc: "Pick any listed model — gpt-5.2, claude-sonnet-4-6, claude-opus-4-7, etc. — and start chatting.",
   },
 ];
 
 const CURL_EXAMPLE = `curl ${BASE_URL}/v1/chat/completions \\
-  -H "Authorization: Bearer $PROXY_API_KEY" \\
+  -H "Authorization: Bearer ${PROXY_API_KEY || "$PROXY_API_KEY"}" \\
   -H "Content-Type: application/json" \\
   -d '{
-    "model": "claude-sonnet-4-6",
+    "model": "claude-opus-4-7",
     "messages": [
       {"role": "user", "content": "Hello!"}
     ]
@@ -311,11 +322,36 @@ export default function App() {
             </Card>
             <Card>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                <div style={{ minWidth: 0, flex: 1 }}>
+                  <div style={{ fontSize: 12, color: MUTED, marginBottom: 4 }}>
+                    API Key (PROXY_API_KEY)
+                  </div>
+                  <code
+                    style={{
+                      color: PROXY_API_KEY ? ORANGE : MUTED,
+                      fontSize: 13,
+                      fontFamily: "Menlo, Monaco, 'Courier New', monospace",
+                      wordBreak: "break-all",
+                      display: "block",
+                    }}
+                  >
+                    {PROXY_API_KEY || "(not generated — set PROXY_API_KEY secret or rebuild)"}
+                  </code>
+                </div>
+                <CopyButton text={PROXY_API_KEY} />
+              </div>
+            </Card>
+            <Card>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
                 <div>
                   <div style={{ fontSize: 12, color: MUTED, marginBottom: 4 }}>Authorization Header</div>
-                  <code style={{ color: BLUE, fontSize: 14 }}>Authorization: Bearer {"<your PROXY_API_KEY>"}</code>
+                  <code style={{ color: BLUE, fontSize: 14 }}>
+                    Authorization: Bearer {PROXY_API_KEY || "<your PROXY_API_KEY>"}
+                  </code>
                 </div>
-                <CopyButton text={`Authorization: Bearer <your PROXY_API_KEY>`} />
+                <CopyButton
+                  text={`Authorization: Bearer ${PROXY_API_KEY || "<your PROXY_API_KEY>"}`}
+                />
               </div>
             </Card>
           </div>

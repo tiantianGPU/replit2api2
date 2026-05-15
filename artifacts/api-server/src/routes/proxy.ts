@@ -6,7 +6,9 @@ const router = Router();
 
 const OPENAI_MODELS = ["gpt-5.2", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3"];
 const ANTHROPIC_MODELS = [
+  "claude-opus-4-7",
   "claude-opus-4-6",
+  "claude-opus-4-6-thinking",
   "claude-sonnet-4-6",
   "claude-haiku-4-5",
 ];
