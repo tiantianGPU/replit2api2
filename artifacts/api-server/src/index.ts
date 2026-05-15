@@ -4,10 +4,51 @@ import { randomBytes } from "node:crypto";
 import app from "./app";
 import { logger } from "./lib/logger";
 
-// Resolve PROXY_API_KEY: prefer env (e.g. Replit Secret); fall back to the
-// .proxy-key file written at build time by scripts/gen-proxy-key.mjs; final
-// fallback generates a fresh key at runtime (covers `pnpm dev` paths).
+// Resolve PROXY_API_KEY with this priority:
+//   1. artifacts/api-portal/.env.production -> VITE_PROXY_API_KEY
+//      This is the value Vite bakes into the frontend bundle at build time
+//      and what users copy/paste into their OpenAI clients. Reading it here
+//      guarantees the backend bearer-check agrees with the displayed key.
+//   2. process.env.PROXY_API_KEY (Replit Secret) — explicit operator override
+//   3. .proxy-key file (cached from previous gen-proxy-key run)
+//   4. fresh randomBytes — last-resort for `pnpm dev` paths before build runs
+//
+// Why VITE_PROXY_API_KEY beats env: a stale Replit Secret left over from a
+// fork template or an unrelated AI Integrations setup can silently desync the
+// backend from the bundle, producing 401s on every chat. The bundle is the
+// source-of-truth users actually see.
+function readVitePortalKey(): { key: string; source: string } | null {
+  let dir = process.cwd();
+  for (let i = 0; i < 5; i++) {
+    const f = resolve(dir, "artifacts/api-portal/.env.production");
+    if (existsSync(f)) {
+      try {
+        const text = readFileSync(f, "utf8");
+        const m = text.match(/^\s*VITE_PROXY_API_KEY\s*=\s*([A-Za-z0-9._-]+)\s*$/m);
+        if (m && m[1]) {
+          return { key: m[1].trim(), source: f };
+        }
+      } catch (err) {
+        logger.warn({ err, file: f }, "failed to read .env.production");
+      }
+    }
+    const parent = resolve(dir, "..");
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
 function ensureProxyApiKey() {
+  const vite = readVitePortalKey();
+  if (vite) {
+    process.env.PROXY_API_KEY = vite.key;
+    logger.info({
+      keyPreview: `${vite.key.slice(0, 8)}...${vite.key.slice(-4)}`,
+      source: vite.source,
+    }, "PROXY_API_KEY loaded from api-portal/.env.production (matches frontend bundle)");
+    return;
+  }
   const envKey = (process.env.PROXY_API_KEY || "").trim();
   if (envKey) {
     process.env.PROXY_API_KEY = envKey;
