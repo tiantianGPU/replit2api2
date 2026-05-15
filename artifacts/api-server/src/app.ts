@@ -34,6 +34,10 @@ app.use(express.json({ limit: "50mb" }));
 app.use(express.urlencoded({ extended: true, limit: "50mb" }));
 
 app.use("/api", router);
+// Also mount /healthz at root so generic uptime checks (e.g. Replit's
+// platform health probe, the replit2api-manage harvester) hit the JSON
+// response instead of falling through to the SPA fallback below.
+app.use(router);
 app.use("/v1", proxyRouter);
 
 // Serve the api-portal SPA static bundle, if present. The build pipeline
@@ -61,10 +65,20 @@ if (portalDir) {
   logger.info({ portalDir: resolvedPortalDir }, "Mounting api-portal SPA at /");
   app.use(express.static(resolvedPortalDir, { maxAge: "1h", index: "index.html" }));
   // SPA fallback: any non-API GET that didn't hit a static file returns the
-  // portal's index.html so client-side routing works on hard refresh.
+  // portal's index.html so client-side routing works on hard refresh. The
+  // explicit `/healthz` exclusion keeps that route serving the JSON response
+  // produced by the health router below.
   app.use((req, res, next) => {
     if (req.method !== "GET" && req.method !== "HEAD") return next();
-    if (req.path.startsWith("/api/") || req.path.startsWith("/v1/")) return next();
+    if (
+      req.path.startsWith("/api/") ||
+      req.path.startsWith("/v1/") ||
+      req.path === "/healthz" ||
+      req.path === "/readyz" ||
+      req.path === "/metrics"
+    ) {
+      return next();
+    }
     if (res.headersSent) return next();
     res.sendFile(resolve(resolvedPortalDir, "index.html"));
   });
