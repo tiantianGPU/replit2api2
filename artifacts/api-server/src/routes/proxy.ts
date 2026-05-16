@@ -35,6 +35,30 @@ function resolveAnthropicModel(model: string): string {
   return ANTHROPIC_MODEL_ALIASES[model] ?? model;
 }
 
+// Convert a Vertex-AI-style Anthropic model id ("claude-opus-4-1@20250805")
+// to the Anthropic-API canonical form ("claude-opus-4-1-20250805").
+//
+// Why: Replit's AI Integration may proxy upstream to *Google Cloud Vertex AI*
+// rather than directly to api.anthropic.com. Vertex uses `@` to separate the
+// version date from the model name, but aggregator integrity probes
+// (tiantianai.co etc.) only know the api.anthropic.com format, so any `@`
+// value in the response `model` field instantly fails the probe. We normalise
+// it on the way out without touching anything else.
+function normalizeAnthropicModelId(raw: string): string {
+  const m = raw.match(/^(claude[A-Za-z0-9-]+?)@(\d{8})$/);
+  return m ? `${m[1]}-${m[2]}` : raw;
+}
+
+// Rewrite every `"model": "..."` occurrence in a chunk of text. Works on both
+// minified JSON bodies and SSE `data:` lines. The regex is tight enough that
+// we don't need to JSON-parse the chunk first.
+function rewriteAnthropicModelInTextChunk(text: string): string {
+  return text.replace(/"model"\s*:\s*"([^"]+)"/g, (full, val: string) => {
+    const fixed = normalizeAnthropicModelId(val);
+    return fixed === val ? full : full.replace(`"${val}"`, `"${fixed}"`);
+  });
+}
+
 // Headers we MUST NOT echo back to the client when transparently proxying
 // (they would corrupt the framing). Everything else (anthropic-*, request-id,
 // x-ratelimit-*, etc.) gets passed through verbatim so integrity probes see
@@ -631,23 +655,51 @@ router.post("/messages", async (req: Request, res: Response) => {
       }
 
       if (!upstream.body) {
-        // Drain via .text() so we still send something coherent.
-        const text = await upstream.text();
+        // Drain via .text() so we still send something coherent (also lets us
+        // run the Vertex->Anthropic model-id normalisation here too).
+        const text = rewriteAnthropicModelInTextChunk(await upstream.text());
         res.send(text);
         return;
       }
 
-      // Raw byte-for-byte stream relay. Works for both SSE (stream:true) and
-      // single-JSON responses; we don't parse, just forward.
+      // Stream relay with a small line buffer. We forward upstream bytes
+      // verbatim except for the `model` field, which we rewrite from the
+      // Vertex form (claude-opus-4-1@20250805) to the Anthropic form
+      // (claude-opus-4-1-20250805) so probes see a real Anthropic model id.
+      // SSE chunks may straddle TCP packets, so we only flush up to the last
+      // newline boundary on each iteration; the trailing partial buffer is
+      // flushed at end.
+      const decoder = new TextDecoder("utf-8");
       const reader = upstream.body.getReader();
+      let pending = "";
+      const flushLineBuffered = (chunk: string) => {
+        const lastNl = chunk.lastIndexOf("\n");
+        if (lastNl < 0) {
+          pending = chunk;
+          return;
+        }
+        const safe = chunk.slice(0, lastNl + 1);
+        pending = chunk.slice(lastNl + 1);
+        const rewritten = rewriteAnthropicModelInTextChunk(safe);
+        res.write(rewritten);
+        (res as unknown as { flush?: () => void }).flush?.();
+      };
       try {
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
           if (value && value.length > 0) {
-            res.write(Buffer.from(value));
-            (res as unknown as { flush?: () => void }).flush?.();
+            const piece = decoder.decode(value, { stream: true });
+            flushLineBuffered(pending + piece);
           }
+        }
+        // Drain decoder state and any leftover (single-JSON body has no
+        // trailing newline; SSE streams may have a final partial line on the
+        // way out).
+        const tail = pending + decoder.decode();
+        if (tail.length > 0) {
+          res.write(rewriteAnthropicModelInTextChunk(tail));
+          (res as unknown as { flush?: () => void }).flush?.();
         }
       } finally {
         try {
