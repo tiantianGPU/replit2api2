@@ -35,6 +35,21 @@ function resolveAnthropicModel(model: string): string {
   return ANTHROPIC_MODEL_ALIASES[model] ?? model;
 }
 
+// Per-model upstream output cap. Vertex AI / api.anthropic.com enforce a
+// hard ceiling on max_tokens that varies by model; clients (Claude Code,
+// our portal, etc.) often default to 64000 which busts the opus cap and
+// triggers HTTP 400 ("max_tokens: 64000 > 32000, which is the maximum
+// allowed number of output tokens for claude-opus-4-1-20250805").
+//
+// We clamp on the way in to keep the request flowing rather than letting
+// the upstream reject it. Source for these numbers: Anthropic + Vertex AI
+// model docs as of 2026-05.
+const ANTHROPIC_MAX_OUTPUT_TOKENS: Record<string, number> = {
+  "claude-opus-4-1-20250805": 32000,
+  "claude-sonnet-4-5-20250929": 64000,
+  "claude-haiku-4-5-20251016": 64000,
+};
+
 // Convert a Vertex-AI-style Anthropic model id ("claude-opus-4-1@20250805")
 // to the Anthropic-API canonical form ("claude-opus-4-1-20250805").
 //
@@ -636,6 +651,42 @@ router.post("/messages", async (req: Request, res: Response) => {
                 : 16000,
           };
         }
+      }
+
+      // Cap max_tokens to the per-model upstream limit so we don't 400 on
+      // claude-opus-4-1 with the client default of 64000. We use the
+      // *real* (resolved) model id for the lookup since the cap is a
+      // property of the upstream weights, not our alias. If thinking is
+      // enabled, also keep budget_tokens strictly less than max_tokens
+      // (Anthropic requires this).
+      const realModel = sanitisedReqBody.model as string;
+      const outCap = ANTHROPIC_MAX_OUTPUT_TOKENS[realModel];
+      if (
+        typeof sanitisedReqBody.max_tokens === "number" &&
+        outCap &&
+        sanitisedReqBody.max_tokens > outCap
+      ) {
+        sanitisedReqBody.max_tokens = outCap;
+      }
+      const sanitisedThinking = sanitisedReqBody.thinking as
+        | { type?: string; budget_tokens?: number }
+        | undefined;
+      if (
+        sanitisedThinking?.type === "enabled" &&
+        typeof sanitisedThinking.budget_tokens === "number" &&
+        typeof sanitisedReqBody.max_tokens === "number" &&
+        sanitisedThinking.budget_tokens >= sanitisedReqBody.max_tokens
+      ) {
+        // budget must be strictly < max_tokens; leave at least 1024 for
+        // the actual response.
+        const safeBudget = Math.max(
+          1024,
+          sanitisedReqBody.max_tokens - 1024,
+        );
+        sanitisedReqBody.thinking = {
+          ...sanitisedThinking,
+          budget_tokens: safeBudget,
+        };
       }
       const upstreamBody = JSON.stringify(sanitisedReqBody);
       const anthropicVersion =
