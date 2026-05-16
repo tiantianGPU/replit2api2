@@ -622,6 +622,16 @@ router.post("/messages", async (req: Request, res: Response) => {
       const sanitisedReqBody: Record<string, unknown> = {
         ...(req.body as Record<string, unknown>),
       };
+
+      // Diagnostic kill-switch: ANTHROPIC_UPSTREAM_DISABLE_SANITISER=1 makes
+      // the proxy forward the body completely as-is. Useful for A/B tests
+      // when investigating whether body sanitation is degrading evals (e.g.
+      // multimodal scoring) versus an upstream-side issue. Note that on a
+      // Vertex backend this WILL re-introduce 400s for adaptive/enabled
+      // mismatch and output_config.format — only enable it briefly.
+      const disableSanitiser =
+        process.env.ANTHROPIC_UPSTREAM_DISABLE_SANITISER === "1";
+
       const reqModel = (sanitisedReqBody.model as string | undefined) ?? "";
       // Match claude-{name}-4-7 or any future claude-{name}-4-{>=7} or 5+,
       // i.e. the generation that uses the new adaptive+effort scheme.
@@ -634,37 +644,75 @@ router.post("/messages", async (req: Request, res: Response) => {
         | { type?: string; budget_tokens?: number }
         | undefined;
 
-      if (usesAdaptiveThinking) {
+      if (disableSanitiser) {
+        // No-op: forward the original body verbatim. The downstream
+        // max_tokens / budget cap block also short-circuits below.
+      } else if (usesAdaptiveThinking) {
         // ------------ 4-7+ schema ------------
-        // Force thinking.type to "adaptive". opus-4-7 explicitly rejects
-        // both "enabled" and "disabled". budget_tokens is no longer used
-        // here (effort goes via output_config.effort).
+        // opus-4-7 explicitly rejects thinking.type='enabled' or 'disabled'
+        // and instead controls reasoning depth via:
+        //     thinking.type        = 'adaptive'  (the only allowed value)
+        //     output_config.effort = low|medium|high|xhigh
+        //
+        // When clients send the legacy shape {type:'enabled', budget_tokens:N}
+        // we MUST translate to adaptive, but we also have to preserve the
+        // *intent* (a high budget signals "think hard, please") by mapping
+        // it to a comparable effort level. Otherwise we'd silently downgrade
+        // every legacy client to default effort, which visibly hurts quality
+        // on multimodal evals, hard reasoning, and long agentic loops.
+        //
+        // Mapping (chosen so 16k -> medium and 32k -> high+ matches the
+        // Anthropic budget guidance for previous models):
+        //     budget < 4096   -> low
+        //     budget < 16000  -> medium
+        //     budget < 32000  -> high
+        //     budget >= 32000 -> xhigh
+        //
+        // type='disabled' -> effort='low' (closest "don't think much")
+        // type='adaptive' -> leave alone, no inferred effort (let Vertex pick)
+        //
+        // We never overwrite output_config.effort if the client provided it
+        // explicitly; the inferred value is only a fallback.
+        let inferredEffort: string | undefined;
         if (thinking && typeof thinking === "object") {
-          if (thinking.type !== "adaptive") {
+          if (thinking.type === "enabled") {
+            const b =
+              typeof thinking.budget_tokens === "number"
+                ? thinking.budget_tokens
+                : 16000;
+            if (b < 4096) inferredEffort = "low";
+            else if (b < 16000) inferredEffort = "medium";
+            else if (b < 32000) inferredEffort = "high";
+            else inferredEffort = "xhigh";
+            sanitisedReqBody.thinking = { type: "adaptive" };
+          } else if (thinking.type === "disabled") {
+            inferredEffort = "low";
+            sanitisedReqBody.thinking = { type: "adaptive" };
+          } else if (thinking.type !== "adaptive") {
+            // unknown type — fall through to adaptive without an effort hint
             sanitisedReqBody.thinking = { type: "adaptive" };
           }
         }
-        // output_config IS supported; only strip the structured-outputs
-        // sub-field which Vertex's schema doesn't accept yet (unless the
-        // operator opted in to keep it for a direct-api.anthropic.com
-        // upstream).
-        const oc = sanitisedReqBody.output_config;
-        if (oc && typeof oc === "object" && !Array.isArray(oc)) {
-          const keep = process.env.ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG === "1";
-          if (!keep) {
-            const cloned = { ...(oc as Record<string, unknown>) };
-            delete cloned.format;
-            if (Object.keys(cloned).length === 0) {
-              delete sanitisedReqBody.output_config;
-            } else {
-              sanitisedReqBody.output_config = cloned;
-            }
-          }
+
+        // output_config IS supported on 4-7+. Strip only the structured-
+        // outputs .format sub-field (Vertex doesn't accept it yet) and merge
+        // in the inferred effort if the client didn't already specify one.
+        const keepOC = process.env.ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG === "1";
+        const ocRaw = sanitisedReqBody.output_config;
+        const ocClone: Record<string, unknown> =
+          ocRaw && typeof ocRaw === "object" && !Array.isArray(ocRaw)
+            ? { ...(ocRaw as Record<string, unknown>) }
+            : {};
+        if (!keepOC) delete ocClone.format;
+        if (inferredEffort && ocClone.effort === undefined) {
+          ocClone.effort = inferredEffort;
         }
-        if (
-          "output_format" in sanitisedReqBody &&
-          process.env.ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG !== "1"
-        ) {
+        if (Object.keys(ocClone).length === 0) {
+          delete sanitisedReqBody.output_config;
+        } else {
+          sanitisedReqBody.output_config = ocClone;
+        }
+        if ("output_format" in sanitisedReqBody && !keepOC) {
           delete sanitisedReqBody.output_format;
         }
       } else {
@@ -693,35 +741,37 @@ router.post("/messages", async (req: Request, res: Response) => {
       // Cap max_tokens to the per-model upstream limit so we don't 400 on
       // claude-opus-4-1 with the client default of 64000. If thinking is
       // enabled, also keep budget_tokens strictly less than max_tokens
-      // (Anthropic requires this).
-      const realModel = (sanitisedReqBody.model as string | undefined) ?? "";
-      const outCap = ANTHROPIC_MAX_OUTPUT_TOKENS[realModel];
-      if (
-        typeof sanitisedReqBody.max_tokens === "number" &&
-        outCap &&
-        sanitisedReqBody.max_tokens > outCap
-      ) {
-        sanitisedReqBody.max_tokens = outCap;
-      }
-      const sanitisedThinking = sanitisedReqBody.thinking as
-        | { type?: string; budget_tokens?: number }
-        | undefined;
-      if (
-        sanitisedThinking?.type === "enabled" &&
-        typeof sanitisedThinking.budget_tokens === "number" &&
-        typeof sanitisedReqBody.max_tokens === "number" &&
-        sanitisedThinking.budget_tokens >= sanitisedReqBody.max_tokens
-      ) {
-        // budget must be strictly < max_tokens; leave at least 1024 for
-        // the actual response.
-        const safeBudget = Math.max(
-          1024,
-          sanitisedReqBody.max_tokens - 1024,
-        );
-        sanitisedReqBody.thinking = {
-          ...sanitisedThinking,
-          budget_tokens: safeBudget,
-        };
+      // (Anthropic requires this). Skipped under the diagnostic kill-switch.
+      if (!disableSanitiser) {
+        const realModel = (sanitisedReqBody.model as string | undefined) ?? "";
+        const outCap = ANTHROPIC_MAX_OUTPUT_TOKENS[realModel];
+        if (
+          typeof sanitisedReqBody.max_tokens === "number" &&
+          outCap &&
+          sanitisedReqBody.max_tokens > outCap
+        ) {
+          sanitisedReqBody.max_tokens = outCap;
+        }
+        const sanitisedThinking = sanitisedReqBody.thinking as
+          | { type?: string; budget_tokens?: number }
+          | undefined;
+        if (
+          sanitisedThinking?.type === "enabled" &&
+          typeof sanitisedThinking.budget_tokens === "number" &&
+          typeof sanitisedReqBody.max_tokens === "number" &&
+          sanitisedThinking.budget_tokens >= sanitisedReqBody.max_tokens
+        ) {
+          // budget must be strictly < max_tokens; leave at least 1024 for
+          // the actual response.
+          const safeBudget = Math.max(
+            1024,
+            sanitisedReqBody.max_tokens - 1024,
+          );
+          sanitisedReqBody.thinking = {
+            ...sanitisedThinking,
+            budget_tokens: safeBudget,
+          };
+        }
       }
       const upstreamBody = JSON.stringify(sanitisedReqBody);
       const anthropicVersion =
