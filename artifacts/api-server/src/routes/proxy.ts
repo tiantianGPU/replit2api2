@@ -602,14 +602,26 @@ router.post("/messages", async (req: Request, res: Response) => {
       const apiKey = process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY ?? "";
 
       // Sanitise the request body before forwarding. Newer Claude Code
-      // clients can send fields the upstream /v1/messages does not yet
-      // accept (this list will grow as the client moves faster than the
-      // server-side schema). We translate them to the closest supported
-      // shape rather than letting the upstream return 400.
+      // clients send fields the upstream /v1/messages does not yet accept
+      // (this list will grow as the client moves faster than the upstream
+      // schema). We translate them to the closest supported shape — or
+      // strip them — rather than letting the upstream return 400.
+      //
       //   - thinking.type = "adaptive"  -> "enabled" with a sensible
       //     default budget_tokens. ("adaptive" is a recent Claude Code
       //     concept that lets the model decide; api.anthropic.com /
       //     Vertex currently accept only "enabled" | "disabled".)
+      //
+      //   - output_config (Structured Outputs, GA on Anthropic 2026-01-29)
+      //     is rejected by Vertex AI's Pydantic schema with
+      //     "output_config: Extra inputs are not permitted". Replit AI
+      //     Integration's Anthropic backend is Vertex, so we strip it.
+      //     (If you ever wire a direct api.anthropic.com upstream, set
+      //      ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG=1 to keep the field.)
+      //
+      //   - Other unknown top-level fields stay in the body; the
+      //     denylist below is intentionally narrow to avoid breaking
+      //     legitimate features that Vertex DOES support.
       const sanitisedReqBody: Record<string, unknown> = {
         ...(req.body as Record<string, unknown>),
       };
@@ -625,6 +637,23 @@ router.post("/messages", async (req: Request, res: Response) => {
                 ? thinking.budget_tokens
                 : 16000,
           };
+        }
+      }
+
+      // Vertex-incompatible top-level fields. Strip unless explicitly opted
+      // in to keep (for future direct-Anthropic-API upstreams).
+      const VERTEX_DROPLIST: Array<{
+        key: string;
+        keepEnv: string;
+      }> = [
+        { key: "output_config", keepEnv: "ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG" },
+        // Older client name for the same feature (pre-GA). Vertex rejects it
+        // for the same reason.
+        { key: "output_format", keepEnv: "ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG" },
+      ];
+      for (const { key, keepEnv } of VERTEX_DROPLIST) {
+        if (key in sanitisedReqBody && process.env[keepEnv] !== "1") {
+          delete sanitisedReqBody[key];
         }
       }
 
