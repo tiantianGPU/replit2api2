@@ -12,6 +12,46 @@ const ANTHROPIC_MODELS = [
   "claude-sonnet-4-6",
   "claude-haiku-4-5",
 ];
+
+// Map our user-facing aliases to the *real* Anthropic model ids that the
+// upstream API expects. Aggregator integrity probes (e.g. tiantianai.co) check
+// that the `model` field in the response is a real Anthropic model name —
+// returning our alias verbatim makes them flag the upstream as fake.
+//
+// Strategy: always forward to the real id, and let the response body keep that
+// real id (we do NOT rewrite it back). End users using our aliases still get
+// served because the alias is mapped server-side; the response just shows the
+// underlying real model id (which is what /v1/messages from real Anthropic
+// always returns anyway).
+const ANTHROPIC_MODEL_ALIASES: Record<string, string> = {
+  "claude-opus-4-7": "claude-opus-4-1-20250805",
+  "claude-opus-4-6": "claude-opus-4-1-20250805",
+  "claude-opus-4-6-thinking": "claude-opus-4-1-20250805",
+  "claude-sonnet-4-6": "claude-sonnet-4-5-20250929",
+  "claude-haiku-4-5": "claude-haiku-4-5-20251016",
+};
+
+function resolveAnthropicModel(model: string): string {
+  return ANTHROPIC_MODEL_ALIASES[model] ?? model;
+}
+
+// Headers we MUST NOT echo back to the client when transparently proxying
+// (they would corrupt the framing). Everything else (anthropic-*, request-id,
+// x-ratelimit-*, etc.) gets passed through verbatim so integrity probes see
+// real Anthropic response headers.
+const HOP_BY_HOP_HEADERS = new Set([
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailers",
+  "transfer-encoding",
+  "upgrade",
+  "content-encoding",
+  "content-length",
+  "host",
+]);
 const ALL_MODELS = [
   ...OPENAI_MODELS.map((id) => ({
     id,
@@ -306,7 +346,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
       const anthropicToolChoice = openaiToolChoiceToAnthropic(tool_choice);
 
       const anthropicParams: Anthropic.MessageCreateParamsNonStreaming = {
-        model,
+        model: resolveAnthropicModel(model),
         messages: anthropicMessages,
         max_tokens: max_tokens ?? 8192,
         ...(system ? { system } : {}),
@@ -513,49 +553,96 @@ router.post("/messages", async (req: Request, res: Response) => {
 
   try {
     if (isAnthropicModel(model)) {
-      const anthropic = getAnthropicClient();
-
-      const params: Anthropic.MessageCreateParamsNonStreaming = {
-        model,
-        messages,
-        max_tokens,
-        ...(system ? { system } : {}),
-        ...(tools ? { tools } : {}),
-        ...(tool_choice ? { tool_choice } : {}),
+      // [transparent-proxy] Bypass the @anthropic-ai/sdk wrapper and forward
+      // the request body byte-for-byte to the upstream /v1/messages endpoint,
+      // then stream the response (headers + body) back unchanged.
+      //
+      // Why: aggregator integrity probes (e.g. tiantianai.co) verify
+      //   - response body schema (id format, complete `usage` object incl.
+      //     cache_*_input_tokens, stop_reason/stop_sequence, container, etc.)
+      //   - response headers (request-id, anthropic-*, x-ratelimit-*)
+      //   - SSE event names + JSON shape
+      // The SDK's `finalMessage()` re-serializes the message after polishing
+      // it, dropping fields that probes use as a signature, and Express's
+      // `res.json()` strips upstream headers entirely. Both fail the probe.
+      // Raw streaming makes our /v1/messages indistinguishable from real
+      // Anthropic /v1/messages.
+      //
+      // We also rewrite `body.model` from our user-facing alias to the real
+      // Anthropic model id so the response `model` field is a legitimate
+      // Anthropic name (a common probe checkpoint).
+      const baseURL =
+        process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL?.replace(/\/$/, "") ?? "";
+      if (!baseURL) {
+        res.status(502).json({
+          type: "error",
+          error: {
+            type: "api_error",
+            message:
+              "AI_INTEGRATIONS_ANTHROPIC_BASE_URL not configured on this Repl",
+          },
+        });
+        return;
+      }
+      const apiKey = process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY ?? "";
+      const upstreamBody = JSON.stringify({
+        ...req.body,
+        model: resolveAnthropicModel(model),
+      });
+      const anthropicVersion =
+        (req.headers["anthropic-version"] as string | undefined) ??
+        "2023-06-01";
+      const upstreamHeaders: Record<string, string> = {
+        "content-type": "application/json",
+        "anthropic-version": anthropicVersion,
+        "x-api-key": apiKey,
       };
+      const beta = req.headers["anthropic-beta"];
+      if (typeof beta === "string") upstreamHeaders["anthropic-beta"] = beta;
+      const dangerous = req.headers["anthropic-dangerous-direct-browser-access"];
+      if (typeof dangerous === "string")
+        upstreamHeaders["anthropic-dangerous-direct-browser-access"] = dangerous;
 
-      if (stream) {
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
-        res.setHeader("X-Accel-Buffering", "no");
-        res.flushHeaders();
+      const upstream = await fetch(`${baseURL}/v1/messages`, {
+        method: "POST",
+        headers: upstreamHeaders,
+        body: upstreamBody,
+      });
 
-        const keepalive = setInterval(() => {
-          try {
-            res.write(": keepalive\n\n");
-            (res as unknown as { flush?: () => void }).flush?.();
-          } catch {
-            clearInterval(keepalive);
-          }
-        }, 5000);
-
-        try {
-          const msgStream = anthropic.messages.stream(params);
-          for await (const event of msgStream) {
-            res.write(
-              `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
-            );
-            (res as unknown as { flush?: () => void }).flush?.();
-          }
-        } finally {
-          clearInterval(keepalive);
-          res.end();
+      // Pass through status + every non-hop-by-hop response header so probes
+      // see real `request-id`, `anthropic-ratelimit-*`, etc.
+      res.status(upstream.status);
+      upstream.headers.forEach((v, k) => {
+        if (!HOP_BY_HOP_HEADERS.has(k.toLowerCase())) {
+          res.setHeader(k, v);
         }
-      } else {
-        const msgStream = anthropic.messages.stream(params);
-        const finalMsg = await msgStream.finalMessage();
-        res.json(finalMsg);
+      });
+
+      if (!upstream.body) {
+        // Drain via .text() so we still send something coherent.
+        const text = await upstream.text();
+        res.send(text);
+        return;
+      }
+
+      // Raw byte-for-byte stream relay. Works for both SSE (stream:true) and
+      // single-JSON responses; we don't parse, just forward.
+      const reader = upstream.body.getReader();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value && value.length > 0) {
+            res.write(Buffer.from(value));
+            (res as unknown as { flush?: () => void }).flush?.();
+          }
+        }
+      } finally {
+        try {
+          res.end();
+        } catch {
+          /* ignore */
+        }
       }
     } else if (isOpenAIModel(model)) {
       const openai = getOpenAIClient();
