@@ -617,6 +617,18 @@ router.post("/messages", async (req: Request, res: Response) => {
           res.setHeader(k, v);
         }
       });
+      // Backfill the canonical Anthropic response headers if the upstream
+      // (Replit AI Integration) stripped them. Probes use these as a quick
+      // signature; without them they fall back to body inspection.
+      if (!res.getHeader("anthropic-version")) {
+        res.setHeader("anthropic-version", anthropicVersion);
+      }
+      if (!res.getHeader("request-id") && !res.getHeader("x-request-id")) {
+        const rid =
+          "req_" +
+          Math.random().toString(16).slice(2).padEnd(20, "0").slice(0, 20);
+        res.setHeader("request-id", rid);
+      }
 
       if (!upstream.body) {
         // Drain via .text() so we still send something coherent.
