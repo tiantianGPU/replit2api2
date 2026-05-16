@@ -609,10 +609,35 @@ router.post("/messages", async (req: Request, res: Response) => {
         return;
       }
       const apiKey = process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY ?? "";
-      const upstreamBody = JSON.stringify({
-        ...req.body,
+
+      // Sanitise the request body before forwarding. Newer Claude Code
+      // clients can send fields the upstream /v1/messages does not yet
+      // accept (this list will grow as the client moves faster than the
+      // server-side schema). We translate them to the closest supported
+      // shape rather than letting the upstream return 400.
+      //   - thinking.type = "adaptive"  -> "enabled" with a sensible
+      //     default budget_tokens. ("adaptive" is a recent Claude Code
+      //     concept that lets the model decide; api.anthropic.com /
+      //     Vertex currently accept only "enabled" | "disabled".)
+      const sanitisedReqBody: Record<string, unknown> = {
+        ...(req.body as Record<string, unknown>),
         model: resolveAnthropicModel(model),
-      });
+      };
+      const thinking = sanitisedReqBody.thinking as
+        | { type?: string; budget_tokens?: number }
+        | undefined;
+      if (thinking && typeof thinking === "object") {
+        if (thinking.type === "adaptive") {
+          sanitisedReqBody.thinking = {
+            type: "enabled",
+            budget_tokens:
+              typeof thinking.budget_tokens === "number"
+                ? thinking.budget_tokens
+                : 16000,
+          };
+        }
+      }
+      const upstreamBody = JSON.stringify(sanitisedReqBody);
       const anthropicVersion =
         (req.headers["anthropic-version"] as string | undefined) ??
         "2023-06-01";
