@@ -13,11 +13,9 @@ const ORANGE = "hsl(28, 95%, 65%)";
 
 const OPENAI_MODELS = ["gpt-5.2", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3"];
 const ANTHROPIC_MODELS = [
-  "claude-opus-4-7",
-  "claude-opus-4-6",
-  "claude-opus-4-6-thinking",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-5",
+  "claude-opus-4-1-20250805",
+  "claude-sonnet-4-5-20250929",
+  "claude-haiku-4-5-20251016",
 ];
 
 const BASE_URL = window.location.origin;
@@ -213,7 +211,7 @@ const STEPS = [
   },
   {
     title: "Select a Model & Chat",
-    desc: "Pick any listed model — gpt-5.2, claude-sonnet-4-6, claude-opus-4-7, etc. — and start chatting.",
+    desc: "Pick any listed model — gpt-5.2, claude-sonnet-4-5-20250929, claude-opus-4-1-20250805, etc. — and start chatting.",
   },
 ];
 
@@ -221,7 +219,7 @@ const CURL_EXAMPLE = `curl ${BASE_URL}/v1/chat/completions \\
   -H "Authorization: Bearer ${PROXY_API_KEY || "$PROXY_API_KEY"}" \\
   -H "Content-Type: application/json" \\
   -d '{
-    "model": "claude-opus-4-7",
+    "model": "claude-opus-4-1-20250805",
     "messages": [
       {"role": "user", "content": "Hello!"}
     ]

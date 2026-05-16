@@ -5,35 +5,17 @@ import Anthropic from "@anthropic-ai/sdk";
 const router = Router();
 
 const OPENAI_MODELS = ["gpt-5.2", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3"];
+
+// We expose the real Anthropic model ids verbatim. No aliasing — clients pass
+// exactly what they want and we forward it. (Aliases historically pointed
+// "claude-opus-4-7" at "claude-opus-4-1-20250805" which was misleading; we
+// removed the alias layer so the model name a client requests is the model
+// they actually get.)
 const ANTHROPIC_MODELS = [
-  "claude-opus-4-7",
-  "claude-opus-4-6",
-  "claude-opus-4-6-thinking",
-  "claude-sonnet-4-6",
-  "claude-haiku-4-5",
+  "claude-opus-4-1-20250805",
+  "claude-sonnet-4-5-20250929",
+  "claude-haiku-4-5-20251016",
 ];
-
-// Map our user-facing aliases to the *real* Anthropic model ids that the
-// upstream API expects. Aggregator integrity probes (e.g. tiantianai.co) check
-// that the `model` field in the response is a real Anthropic model name —
-// returning our alias verbatim makes them flag the upstream as fake.
-//
-// Strategy: always forward to the real id, and let the response body keep that
-// real id (we do NOT rewrite it back). End users using our aliases still get
-// served because the alias is mapped server-side; the response just shows the
-// underlying real model id (which is what /v1/messages from real Anthropic
-// always returns anyway).
-const ANTHROPIC_MODEL_ALIASES: Record<string, string> = {
-  "claude-opus-4-7": "claude-opus-4-1-20250805",
-  "claude-opus-4-6": "claude-opus-4-1-20250805",
-  "claude-opus-4-6-thinking": "claude-opus-4-1-20250805",
-  "claude-sonnet-4-6": "claude-sonnet-4-5-20250929",
-  "claude-haiku-4-5": "claude-haiku-4-5-20251016",
-};
-
-function resolveAnthropicModel(model: string): string {
-  return ANTHROPIC_MODEL_ALIASES[model] ?? model;
-}
 
 // Per-model upstream output cap. Vertex AI / api.anthropic.com enforce a
 // hard ceiling on max_tokens that varies by model; clients (Claude Code,
@@ -385,7 +367,7 @@ router.post("/chat/completions", async (req: Request, res: Response) => {
       const anthropicToolChoice = openaiToolChoiceToAnthropic(tool_choice);
 
       const anthropicParams: Anthropic.MessageCreateParamsNonStreaming = {
-        model: resolveAnthropicModel(model),
+        model,
         messages: anthropicMessages,
         max_tokens: max_tokens ?? 8192,
         ...(system ? { system } : {}),
@@ -607,9 +589,9 @@ router.post("/messages", async (req: Request, res: Response) => {
       // Raw streaming makes our /v1/messages indistinguishable from real
       // Anthropic /v1/messages.
       //
-      // We also rewrite `body.model` from our user-facing alias to the real
-      // Anthropic model id so the response `model` field is a legitimate
-      // Anthropic name (a common probe checkpoint).
+      // body.model is forwarded verbatim — clients are expected to pass real
+      // Anthropic model ids (claude-opus-4-1-20250805 etc.). The previous
+      // alias layer was removed.
       const baseURL =
         process.env.AI_INTEGRATIONS_ANTHROPIC_BASE_URL?.replace(/\/$/, "") ?? "";
       if (!baseURL) {
@@ -636,7 +618,6 @@ router.post("/messages", async (req: Request, res: Response) => {
       //     Vertex currently accept only "enabled" | "disabled".)
       const sanitisedReqBody: Record<string, unknown> = {
         ...(req.body as Record<string, unknown>),
-        model: resolveAnthropicModel(model),
       };
       const thinking = sanitisedReqBody.thinking as
         | { type?: string; budget_tokens?: number }
@@ -654,12 +635,10 @@ router.post("/messages", async (req: Request, res: Response) => {
       }
 
       // Cap max_tokens to the per-model upstream limit so we don't 400 on
-      // claude-opus-4-1 with the client default of 64000. We use the
-      // *real* (resolved) model id for the lookup since the cap is a
-      // property of the upstream weights, not our alias. If thinking is
+      // claude-opus-4-1 with the client default of 64000. If thinking is
       // enabled, also keep budget_tokens strictly less than max_tokens
       // (Anthropic requires this).
-      const realModel = sanitisedReqBody.model as string;
+      const realModel = (sanitisedReqBody.model as string | undefined) ?? "";
       const outCap = ANTHROPIC_MAX_OUTPUT_TOKENS[realModel];
       if (
         typeof sanitisedReqBody.max_tokens === "number" &&
