@@ -601,59 +601,92 @@ router.post("/messages", async (req: Request, res: Response) => {
       }
       const apiKey = process.env.AI_INTEGRATIONS_ANTHROPIC_API_KEY ?? "";
 
-      // Sanitise the request body before forwarding. Newer Claude Code
-      // clients send fields the upstream /v1/messages does not yet accept
-      // (this list will grow as the client moves faster than the upstream
-      // schema). We translate them to the closest supported shape — or
-      // strip them — rather than letting the upstream return 400.
+      // Sanitise the request body before forwarding. The schema Vertex
+      // accepts is *model-specific*: the 4-7 generation introduced a new
+      // thinking mechanism (adaptive + output_config.effort) and rejects
+      // the legacy thinking.type=enabled, while older models on the same
+      // backend still use the legacy mechanism and reject output_config.
+      // Claude Code defaults to the new shape; we therefore translate IN
+      // BOTH DIRECTIONS depending on the target model.
       //
-      //   - thinking.type = "adaptive"  -> "enabled" with a sensible
-      //     default budget_tokens. ("adaptive" is a recent Claude Code
-      //     concept that lets the model decide; api.anthropic.com /
-      //     Vertex currently accept only "enabled" | "disabled".)
+      // Schema by generation (as of 2026-05):
       //
-      //   - output_config (Structured Outputs, GA on Anthropic 2026-01-29)
-      //     is rejected by Vertex AI's Pydantic schema with
-      //     "output_config: Extra inputs are not permitted". Replit AI
-      //     Integration's Anthropic backend is Vertex, so we strip it.
-      //     (If you ever wire a direct api.anthropic.com upstream, set
-      //      ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG=1 to keep the field.)
+      //   4-7+  ("opus-4-7" and any future dateless 4-7-or-newer):
+      //     thinking.type      MUST be "adaptive"
+      //     output_config      ALLOWED (effort: low|medium|high|xhigh)
+      //     output_config.format (Structured Outputs)  NOT on Vertex
       //
-      //   - Other unknown top-level fields stay in the body; the
-      //     denylist below is intentionally narrow to avoid breaking
-      //     legitimate features that Vertex DOES support.
+      //   4-6 / sonnet-4-6 / haiku-4-5 / earlier:
+      //     thinking.type      MUST be "enabled" or "disabled"
+      //     output_config      NOT accepted at all
       const sanitisedReqBody: Record<string, unknown> = {
         ...(req.body as Record<string, unknown>),
       };
+      const reqModel = (sanitisedReqBody.model as string | undefined) ?? "";
+      // Match claude-{name}-4-7 or any future claude-{name}-4-{>=7} or 5+,
+      // i.e. the generation that uses the new adaptive+effort scheme.
+      const usesAdaptiveThinking =
+        /^claude-(opus|sonnet|haiku)-4-(?:7|8|9)$/.test(reqModel) ||
+        /^claude-(opus|sonnet|haiku)-(?:[5-9])-/.test(reqModel) ||
+        /^claude-(opus|sonnet|haiku)-(?:[5-9])$/.test(reqModel);
+
       const thinking = sanitisedReqBody.thinking as
         | { type?: string; budget_tokens?: number }
         | undefined;
-      if (thinking && typeof thinking === "object") {
-        if (thinking.type === "adaptive") {
-          sanitisedReqBody.thinking = {
-            type: "enabled",
-            budget_tokens:
-              typeof thinking.budget_tokens === "number"
-                ? thinking.budget_tokens
-                : 16000,
-          };
-        }
-      }
 
-      // Vertex-incompatible top-level fields. Strip unless explicitly opted
-      // in to keep (for future direct-Anthropic-API upstreams).
-      const VERTEX_DROPLIST: Array<{
-        key: string;
-        keepEnv: string;
-      }> = [
-        { key: "output_config", keepEnv: "ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG" },
-        // Older client name for the same feature (pre-GA). Vertex rejects it
-        // for the same reason.
-        { key: "output_format", keepEnv: "ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG" },
-      ];
-      for (const { key, keepEnv } of VERTEX_DROPLIST) {
-        if (key in sanitisedReqBody && process.env[keepEnv] !== "1") {
-          delete sanitisedReqBody[key];
+      if (usesAdaptiveThinking) {
+        // ------------ 4-7+ schema ------------
+        // Force thinking.type to "adaptive". opus-4-7 explicitly rejects
+        // both "enabled" and "disabled". budget_tokens is no longer used
+        // here (effort goes via output_config.effort).
+        if (thinking && typeof thinking === "object") {
+          if (thinking.type !== "adaptive") {
+            sanitisedReqBody.thinking = { type: "adaptive" };
+          }
+        }
+        // output_config IS supported; only strip the structured-outputs
+        // sub-field which Vertex's schema doesn't accept yet (unless the
+        // operator opted in to keep it for a direct-api.anthropic.com
+        // upstream).
+        const oc = sanitisedReqBody.output_config;
+        if (oc && typeof oc === "object" && !Array.isArray(oc)) {
+          const keep = process.env.ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG === "1";
+          if (!keep) {
+            const cloned = { ...(oc as Record<string, unknown>) };
+            delete cloned.format;
+            if (Object.keys(cloned).length === 0) {
+              delete sanitisedReqBody.output_config;
+            } else {
+              sanitisedReqBody.output_config = cloned;
+            }
+          }
+        }
+        if (
+          "output_format" in sanitisedReqBody &&
+          process.env.ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG !== "1"
+        ) {
+          delete sanitisedReqBody.output_format;
+        }
+      } else {
+        // ------------ 4-6 and older schema ------------
+        // thinking.type MUST be enabled|disabled. Translate Claude Code's
+        // default "adaptive" to "enabled" with a sensible budget.
+        if (thinking && typeof thinking === "object") {
+          if (thinking.type === "adaptive") {
+            sanitisedReqBody.thinking = {
+              type: "enabled",
+              budget_tokens:
+                typeof thinking.budget_tokens === "number"
+                  ? thinking.budget_tokens
+                  : 16000,
+            };
+          }
+        }
+        // output_config is NOT accepted on these older models; strip it
+        // entirely (unless explicitly kept for direct-Anthropic upstream).
+        if (process.env.ANTHROPIC_UPSTREAM_KEEP_OUTPUT_CONFIG !== "1") {
+          delete sanitisedReqBody.output_config;
+          delete sanitisedReqBody.output_format;
         }
       }
 
