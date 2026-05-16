@@ -6,31 +6,25 @@ const router = Router();
 
 const OPENAI_MODELS = ["gpt-5.2", "gpt-5-mini", "gpt-5-nano", "o4-mini", "o3"];
 
-// We expose the real Anthropic model ids verbatim. No aliasing — clients pass
-// exactly what they want and we forward it. (Aliases historically pointed
-// "claude-opus-4-7" at "claude-opus-4-1-20250805" which was misleading; we
-// removed the alias layer so the model name a client requests is the model
-// they actually get.)
+// Real Anthropic model ids forwarded byte-for-byte to the upstream. The 4.6
+// generation onwards is dateless (claude-opus-4-7, claude-sonnet-4-6) and
+// Vertex AI uses the exact same id; the 4.5 generation is dated
+// (claude-haiku-4-5-20251016) but the dateless alias `claude-haiku-4-5` is
+// also accepted on Anthropic API and resolves to the latest snapshot.
 const ANTHROPIC_MODELS = [
-  "claude-opus-4-1-20250805",
-  "claude-sonnet-4-5-20250929",
-  "claude-haiku-4-5-20251016",
+  "claude-opus-4-7",
+  "claude-opus-4-6",
+  "claude-sonnet-4-6",
+  "claude-haiku-4-5",
 ];
 
-// Per-model upstream output cap. Vertex AI / api.anthropic.com enforce a
-// hard ceiling on max_tokens that varies by model; clients (Claude Code,
-// our portal, etc.) often default to 64000 which busts the opus cap and
-// triggers HTTP 400 ("max_tokens: 64000 > 32000, which is the maximum
-// allowed number of output tokens for claude-opus-4-1-20250805").
-//
-// We clamp on the way in to keep the request flowing rather than letting
-// the upstream reject it. Source for these numbers: Anthropic + Vertex AI
-// model docs as of 2026-05.
-const ANTHROPIC_MAX_OUTPUT_TOKENS: Record<string, number> = {
-  "claude-opus-4-1-20250805": 32000,
-  "claude-sonnet-4-5-20250929": 64000,
-  "claude-haiku-4-5-20251016": 64000,
-};
+// Per-model upstream output cap. We trust the upstream (api.anthropic.com /
+// Vertex) to enforce the correct ceiling for each real model id; an entry
+// here only exists to *defensively* clamp client requests that we know would
+// blow a known cap before the upstream rejects them. Currently empty because
+// every model in ANTHROPIC_MODELS supports >= 64k max output. Add an entry
+// only when a 400 is observed in practice.
+const ANTHROPIC_MAX_OUTPUT_TOKENS: Record<string, number> = {};
 
 // Convert a Vertex-AI-style Anthropic model id ("claude-opus-4-1@20250805")
 // to the Anthropic-API canonical form ("claude-opus-4-1-20250805").
